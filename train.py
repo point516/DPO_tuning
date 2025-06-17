@@ -176,7 +176,8 @@ def main():
         learning_rate=args.learning_rate,
         bf16=torch.cuda.is_available(),
         logging_steps=10,
-        save_steps=250,
+        # save_steps=250,
+        save_strategy="no",
         report_to=["wandb"] if args.wandb_project else None,
     )
 
