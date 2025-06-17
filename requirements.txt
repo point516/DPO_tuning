@@ -1,0 +1,25 @@
+# Core deep-learning
+torch==2.7.1          # 04 Jun 2025 stable :contentReference[oaicite:0]{index=0}
+
+# Hugging Face ecosystem
+transformers==4.52.4  # 11 Jun 2025 latest :contentReference[oaicite:1]{index=1}
+datasets>=2.20.0
+accelerate==1.7.0     # 15 May 2025 :contentReference[oaicite:2]{index=2}
+trl==0.18.1           # 03 Jun 2025 (DPOTrainer) :contentReference[oaicite:3]{index=3}
+peft>=0.14.0          # for LoRA / merge-adapters
+
+# Quantisation & memory tricks (optional but handy on 40 GB)
+bitsandbytes>=0.43.0  # includes CUDA 12.6 wheels :contentReference[oaicite:4]{index=4}
+
+# Eval / tracking
+evaluate==0.4.3
+wandb>=0.17.0
+lm-eval[all]>=0.4.4  # for benchmark evaluation
+
+# Fairness & bias evaluation
+detoxify>=0.5.2      # for toxicity detection in RealToxicityPrompts
+bias-bench>=1.1.0    # for bias evaluation
+
+# Misc
+tqdm
+sentencepiece     # some tokenisers still rely on it
