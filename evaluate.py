@@ -46,13 +46,9 @@ import numpy as np
 from datasets import load_dataset
 import random
 
-try:
-    import lm_eval
-    from lm_eval import evaluator
-    from lm_eval.models.huggingface import HFLM
-except ImportError:
-    print("Error: lm-eval-harness not installed. Please install with: pip install lm-eval")
-    sys.exit(1)
+
+from lm_eval import simple_evaluate
+
 
 try:
     from detoxify import Detoxify
@@ -75,14 +71,12 @@ def evaluate_arc_easy(model_path: str, device: str = "auto") -> Dict[str, Any]:
     """Evaluate model on ARC-Easy benchmark."""
     print("Evaluating on ARC-Easy...")
     
-    results = evaluator.simple_evaluate(
+    results = simple_evaluate(
         model="hf",
         model_args=f"pretrained={model_path},device_map={device}",
         tasks=["arc_easy"],
         batch_size="auto",
-        max_batch_size=8,
         device=device,
-        use_cache=False,
     )
     
     return results
@@ -92,14 +86,12 @@ def evaluate_arc_challenge(model_path: str, device: str = "auto") -> Dict[str, A
     """Evaluate model on ARC-Challenge benchmark."""
     print("Evaluating on ARC-Challenge...")
     
-    results = evaluator.simple_evaluate(
+    results = simple_evaluate(
         model="hf",
         model_args=f"pretrained={model_path},device_map={device}",
         tasks=["arc_challenge"],
         batch_size="auto",
-        max_batch_size=8,
         device=device,
-        use_cache=False,
     )
     
     return results
@@ -109,14 +101,12 @@ def evaluate_hellaswag(model_path: str, device: str = "auto") -> Dict[str, Any]:
     """Evaluate model on HellaSwag test set."""
     print("Evaluating on HellaSwag...")
     
-    results = evaluator.simple_evaluate(
+    results = simple_evaluate(
         model="hf",
         model_args=f"pretrained={model_path},device_map={device}",
         tasks=["hellaswag"],
         batch_size="auto",
-        max_batch_size=8,
         device=device,
-        use_cache=False,
     )
     
     return results
@@ -126,14 +116,12 @@ def evaluate_boolq(model_path: str, device: str = "auto") -> Dict[str, Any]:
     """Evaluate model on BoolQ validation set."""
     print("Evaluating on BoolQ...")
     
-    results = evaluator.simple_evaluate(
+    results = simple_evaluate(
         model="hf",
         model_args=f"pretrained={model_path},device_map={device}",
         tasks=["boolq"],
         batch_size="auto",
-        max_batch_size=8,
         device=device,
-        use_cache=False,
     )
     
     return results
@@ -143,14 +131,12 @@ def evaluate_all_benchmarks(model_path: str, device: str = "auto") -> Dict[str, 
     """Evaluate model on all benchmarks at once for efficiency."""
     print("Evaluating on all benchmarks...")
     
-    results = evaluator.simple_evaluate(
+    results = simple_evaluate(
         model="hf",
         model_args=f"pretrained={model_path},device_map={device}",
         tasks=["arc_easy", "arc_challenge", "hellaswag", "boolq"],
         batch_size="auto",
-        max_batch_size=8,
         device=device,
-        use_cache=False,
     )
     
     return results
@@ -160,14 +146,12 @@ def evaluate_performance_benchmarks(model_path: str, device: str = "auto") -> Di
     """Evaluate model on performance benchmarks (ARC-Easy, ARC-Challenge, HellaSwag, BoolQ)."""
     print("Evaluating on performance benchmarks...")
     
-    results = evaluator.simple_evaluate(
+    results = simple_evaluate(
         model="hf",
         model_args=f"pretrained={model_path},device_map={device}",
         tasks=["arc_easy", "arc_challenge", "hellaswag", "boolq"],
         batch_size="auto",
-        max_batch_size=8,
         device=device,
-        use_cache=False,
     )
     
     return results
