@@ -69,7 +69,7 @@ def evaluate_arc_easy(model_path: str, device: str = "auto") -> Dict[str, Any]:
     
     results = simple_evaluate(
         model="hf",
-        model_args=f"pretrained={model_path},device_map={device}",
+        model_args=f"pretrained={model_path},device_map={device},torch_dtype=torch.bfloat16",
         tasks=["arc_easy"],
         batch_size="auto",
         device=device,
@@ -84,7 +84,7 @@ def evaluate_arc_challenge(model_path: str, device: str = "auto") -> Dict[str, A
     
     results = simple_evaluate(
         model="hf",
-        model_args=f"pretrained={model_path},device_map={device}",
+        model_args=f"pretrained={model_path},device_map={device},torch_dtype=torch.bfloat16",
         tasks=["arc_challenge"],
         batch_size="auto",
         device=device,
@@ -99,7 +99,7 @@ def evaluate_hellaswag(model_path: str, device: str = "auto") -> Dict[str, Any]:
     
     results = simple_evaluate(
         model="hf",
-        model_args=f"pretrained={model_path},device_map={device}",
+        model_args=f"pretrained={model_path},device_map={device},torch_dtype=torch.bfloat16",
         tasks=["hellaswag"],
         batch_size="auto",
         device=device,
@@ -114,7 +114,7 @@ def evaluate_boolq(model_path: str, device: str = "auto") -> Dict[str, Any]:
     
     results = simple_evaluate(
         model="hf",
-        model_args=f"pretrained={model_path},device_map={device}",
+        model_args=f"pretrained={model_path},device_map={device},torch_dtype=torch.bfloat16",
         tasks=["boolq"],
         batch_size="auto",
         device=device,
@@ -129,7 +129,7 @@ def evaluate_all_benchmarks(model_path: str, device: str = "auto") -> Dict[str, 
     
     results = simple_evaluate(
         model="hf",
-        model_args=f"pretrained={model_path},device_map={device}",
+        model_args=f"pretrained={model_path},device_map={device},torch_dtype=torch.bfloat16",
         tasks=["arc_easy", "arc_challenge", "hellaswag", "boolq"],
         batch_size="auto",
         device=device,
@@ -144,7 +144,7 @@ def evaluate_performance_benchmarks(model_path: str, device: str = "auto") -> Di
     
     results = simple_evaluate(
         model="hf",
-        model_args=f"pretrained={model_path},device_map={device}",
+        model_args=f"pretrained={model_path},device_map={device},torch_dtype=torch.bfloat16",
         tasks=["arc_easy", "arc_challenge", "hellaswag", "boolq"],
         batch_size="auto",
         device=device,
