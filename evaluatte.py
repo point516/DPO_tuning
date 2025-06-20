@@ -12,7 +12,7 @@ Performance Benchmarks:
 Fairness Benchmarks:
 - HH-RLHF (test set) with win-rate metric
 - RealToxicityPrompts (10000 rows) with Detoxify
-- BiasBench with bias-bench
+- StereoSet for stereotype bias detection
 
 Usage examples:
     # Evaluate on all benchmarks
@@ -28,7 +28,7 @@ Usage examples:
     python evaluate.py --model_path ./dpo_output --arc_easy --hellaswag
 
     # Load saved model and evaluate
-    python evaluate.py --model_path ./saved_model --boolq
+    python evaluate.py --model_path ./saved_model --boolq --stereoset
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-import torch
+import torch        
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 from datasets import load_dataset
@@ -56,12 +56,8 @@ except ImportError:
     print("Warning: detoxify not installed. RealToxicityPrompts evaluation will be skipped.")
     Detoxify = None
 
-try:
-    import bias_bench
-    from bias_bench.benchmark import Benchmark
-except ImportError:
-    print("Warning: bias-bench not installed. BiasBench evaluation will be skipped.")
-    bias_bench = None
+# StereoSet evaluation availability check
+stereoset_available = True  # datasets is already imported above
 
 ################################################################################
 # Evaluation functions for each benchmark
@@ -324,45 +320,114 @@ def evaluate_realtoxicityprompts(model_path: str, device: str = "auto") -> Dict[
         return {"results": {"realtoxicityprompts": {"error": str(e)}}}
 
 
-def evaluate_biasbench(model_path: str, device: str = "auto") -> Dict[str, Any]:
-    """Evaluate model on BiasBench with bias-bench."""
-    print("Evaluating on BiasBench...")
+def evaluate_stereoset(model_path: str, device: str = "auto") -> Dict[str, Any]:
+    """Evaluate model on StereoSet for stereotype bias detection."""
+    print("Evaluating on StereoSet...")
     
-    if bias_bench is None:
-        return {"results": {"biasbench": {"error": "bias-bench not installed"}}}
+    if not stereoset_available:
+        return {"results": {"stereoset": {"error": "datasets library not available"}}}
     
     try:
-        # Load model for bias-bench
-        from transformers import pipeline
+        # Load StereoSet dataset
+        dataset = load_dataset("stereoset", "intrasentence", split="validation")
         
-        model_pipeline = pipeline(
-            "text-generation",
-            model=model_path,
-            tokenizer=model_path,
-            device_map=device,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        # Load model and tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map=device
         )
         
-        # Initialize bias benchmark
-        benchmark = Benchmark(
-            model=model_pipeline,
-            tokenizer_name=model_path
-        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         
-        # Run bias evaluation
-        bias_results = benchmark.evaluate_all()
+        stereotype_scores = []
+        anti_stereotype_scores = []
+        unrelated_scores = []
+        
+        print(f"Evaluating on {len(dataset)} StereoSet examples...")
+        
+        for example in dataset:
+            context = example["context"]
+            sentences = example["sentences"]
+            
+            sentence_scores = []
+            sentence_types = []
+            
+            for sentence_data in sentences:
+                sentence = sentence_data["sentence"]
+                sentence_type = sentence_data["gold_label"]  # stereotype, anti-stereotype, unrelated
+                
+                # Calculate sentence probability
+                full_text = context + " " + sentence
+                inputs = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=512)
+                
+                if torch.cuda.is_available():
+                    inputs = {k: v.cuda() for k, v in inputs.items()}
+                
+                with torch.no_grad():
+                    outputs = model(**inputs, labels=inputs["input_ids"])
+                    # Convert loss to probability (higher is better)
+                    prob = torch.exp(-outputs.loss).item()
+                    
+                sentence_scores.append(prob)
+                sentence_types.append(sentence_type)
+            
+            # Normalize scores within this example
+            total_score = sum(sentence_scores)
+            if total_score > 0:
+                normalized_scores = [score / total_score for score in sentence_scores]
+            else:
+                normalized_scores = [1.0 / len(sentence_scores)] * len(sentence_scores)
+            
+            # Categorize scores by type
+            for score, sentence_type in zip(normalized_scores, sentence_types):
+                if sentence_type == "stereotype":
+                    stereotype_scores.append(score)
+                elif sentence_type == "anti-stereotype":
+                    anti_stereotype_scores.append(score)
+                elif sentence_type == "unrelated":
+                    unrelated_scores.append(score)
+        
+        # Calculate metrics
+        mean_stereotype_score = np.mean(stereotype_scores) if stereotype_scores else 0.0
+        mean_anti_stereotype_score = np.mean(anti_stereotype_scores) if anti_stereotype_scores else 0.0
+        mean_unrelated_score = np.mean(unrelated_scores) if unrelated_scores else 0.0
+        
+        # Calculate bias score (lower is better - indicates less bias)
+        # Bias score is the difference between stereotype and anti-stereotype scores
+        bias_score = mean_stereotype_score - mean_anti_stereotype_score
+        
+        # Calculate language modeling score (higher is better)
+        # LM score compares meaningful sentences vs unrelated
+        lm_score = (mean_stereotype_score + mean_anti_stereotype_score) / 2 - mean_unrelated_score
+        
+        # Calculate idealized overall score (balances bias and language modeling)
+        # We want high LM score and low bias score
+        overall_score = lm_score - abs(bias_score)
         
         results = {
             "results": {
-                "biasbench": bias_results
+                "stereoset": {
+                    "bias_score": bias_score,
+                    "lm_score": lm_score,
+                    "overall_score": overall_score,
+                    "mean_stereotype_score": mean_stereotype_score,
+                    "mean_anti_stereotype_score": mean_anti_stereotype_score,
+                    "mean_unrelated_score": mean_unrelated_score,
+                    "num_stereotype": len(stereotype_scores),
+                    "num_anti_stereotype": len(anti_stereotype_scores),
+                    "num_unrelated": len(unrelated_scores)
+                }
             }
         }
         
         return results
         
     except Exception as e:
-        print(f"Error evaluating bias-bench: {e}")
-        return {"results": {"biasbench": {"error": str(e)}}}
+        print(f"Error evaluating StereoSet: {e}")
+        return {"results": {"stereoset": {"error": str(e)}}}
 
 
 def evaluate_fairness_benchmarks(model_path: str, device: str = "auto") -> Dict[str, Any]:
@@ -379,9 +444,9 @@ def evaluate_fairness_benchmarks(model_path: str, device: str = "auto") -> Dict[
     rtp_results = evaluate_realtoxicityprompts(model_path, device)
     all_results["results"].update(rtp_results["results"])
     
-    # BiasBench
-    bb_results = evaluate_biasbench(model_path, device)
-    all_results["results"].update(bb_results["results"])
+    # StereoSet
+    ss_results = evaluate_stereoset(model_path, device)
+    all_results["results"].update(ss_results["results"])
     
     return all_results
 
@@ -520,7 +585,7 @@ def parse_args():
     parser.add_argument(
         "--fairness",
         action="store_true",
-        help="Evaluate on fairness benchmarks (HH-RLHF, RealToxicityPrompts, BiasBench)"
+        help="Evaluate on fairness benchmarks (HH-RLHF, RealToxicityPrompts, StereoSet)"
     )
     
     # Individual fairness benchmarks
@@ -537,9 +602,9 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--biasbench",
+        "--stereoset",
         action="store_true",
-        help="Evaluate on BiasBench"
+        help="Evaluate on StereoSet for stereotype bias detection"
     )
     
     # Output configuration
@@ -568,8 +633,8 @@ def main():
     args = parse_args()
     
     # Verify model path
-    if not verify_model_path(args.model_path):
-        sys.exit(1)
+    # if not verify_model_path(args.model_path):
+    #     sys.exit(1)
     
     # Determine which benchmarks to run
     run_benchmarks = []
@@ -596,8 +661,8 @@ def main():
             run_benchmarks.append("hh_rlhf")
         if args.realtoxicityprompts:
             run_benchmarks.append("realtoxicityprompts")
-        if args.biasbench:
-            run_benchmarks.append("biasbench")
+        if args.stereoset:
+            run_benchmarks.append("stereoset")
     
     # If no specific benchmarks selected, default to all
     if not run_benchmarks:
@@ -657,8 +722,8 @@ def main():
                 results = evaluate_realtoxicityprompts(args.model_path, args.device)
                 all_results["results"].update(results["results"])
             
-            if "biasbench" in run_benchmarks:
-                results = evaluate_biasbench(args.model_path, args.device)
+            if "stereoset" in run_benchmarks:
+                results = evaluate_stereoset(args.model_path, args.device)
                 all_results["results"].update(results["results"])
     
     except Exception as e:
