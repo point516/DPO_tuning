@@ -9,8 +9,8 @@ Run locally or on a single‑GPU cloud instance (e.g. RunPod A100). Example:
         --subset_size 20000 \
         --subset_strategy random \
         --output_dir ./dpo_dolly_20k \
-        --batch_size 128 \
-        --gradient_accumulation_steps 4 \
+        --batch_size 32 \
+        --gradient_accumulation_steps 16 \
         --epochs 3 \
         --learning_rate 2e-5 \
         --beta 0.1
@@ -35,7 +35,7 @@ from transformers import (
     AutoTokenizer,
     set_seed,
 )
-from trl import DPOTrainer, DataCollatorForCompletionOnlyLM
+from trl import DPOTrainer, DPOConfig
 from accelerate import Accelerator
 
 ################################################################################
@@ -89,11 +89,16 @@ def parse_args():
 
     # Training hyper‑parameters
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=32, help="Reduced default batch size for memory efficiency")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Increased to maintain effective batch size")
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.1, help="β coefficient in DPO objective")
     parser.add_argument("--max_len", type=int, default=512)
+
+    # Memory optimization options
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing to save memory")
+    parser.add_argument("--use_4bit", action="store_true", help="Use 4-bit quantization for even more memory savings")
+    parser.add_argument("--share_reference_model", action="store_true", default=True, help="Share reference model to save memory")
 
     # Misc
     parser.add_argument("--output_dir", default="./dpo_output")
@@ -109,9 +114,18 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Set environment variable for memory fragmentation
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
     accelerator = Accelerator(log_with="wandb" if args.wandb_project else None)
     if accelerator.is_main_process:
         print("Loading base & reference models…")
+        print(f"Memory optimization settings:")
+        print(f"  - Batch size: {args.batch_size}")
+        print(f"  - Gradient accumulation steps: {args.gradient_accumulation_steps}")
+        print(f"  - Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+        print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
+        print(f"  - Share reference model: {args.share_reference_model}")
 
     # Ensure determinism
     set_seed(args.seed)
@@ -120,21 +134,48 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="right")
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+    
+    # Fix warning: ensure pad_token_id and eos_token_id are different
+    if tokenizer.pad_token_id == tokenizer.eos_token_id:
+        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+        print(f"Fixed tokenizer: pad_token_id={tokenizer.pad_token_id}, eos_token_id={tokenizer.eos_token_id}")
+
+    # Prepare model loading kwargs
+    model_kwargs = {
+        "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        "device_map": "auto",
+        "trust_remote_code": True,
+    }
+
+    # Add quantization if requested
+    if args.use_4bit:
+        from transformers import BitsAndBytesConfig
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4"
+        )
 
     # Load policy model (trainable)
-    policy_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-    )
+    policy_model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
     policy_model.resize_token_embeddings(len(tokenizer))
 
-    # Reference model (frozen) – same weights as policy at init
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-    )
+    # Enable gradient checkpointing for memory savings
+    if args.gradient_checkpointing:
+        policy_model.gradient_checkpointing_enable()
+
+    # Reference model handling
+    if args.share_reference_model:
+        # Use the same model for reference (memory efficient)
+        ref_model = None
+        if accelerator.is_main_process:
+            print("Using shared reference model (memory efficient)")
+    else:
+        # Load separate reference model (more memory but potentially better results)
+        ref_model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
+        if accelerator.is_main_process:
+            print("Using separate reference model")
 
     # Dataset
     if accelerator.is_main_process:
@@ -145,45 +186,46 @@ def main():
         seed=args.subset_seed,
     )
 
-    # Data collator – add BOS token before chosen/rejected completions
-    collator = DataCollatorForCompletionOnlyLM(
-        tokenizer=tokenizer,
-        response_template="<|assistant|>",  # Dolly instruct format
-        instruction_template="<|user|>",
-        padding=True,
-    )
-
-    # Trainer
-    trainer = DPOTrainer(
-        model=policy_model,
-        ref_model=ref_model,
-        args=None,  # we’ll build TrainingArguments below
-        beta=args.beta,
-        train_dataset=train_dataset,
-        tokenizer=tokenizer,
-        dataset_text_field="prompt",
-        collator=collator,
-        max_length=args.max_len,
-        peft_config=None,
-    )
-
-    # Build HF TrainingArguments through trainer utility for simplicity
-    trainer._prepare_training_args(
+    # Create DPO training arguments with memory optimizations
+    training_args = DPOConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
+        beta=args.beta,
         bf16=torch.cuda.is_available(),
+        fp16=not torch.cuda.is_available(),
         logging_steps=10,
-        # save_steps=250,
-        save_strategy="no",
+        save_strategy="epoch",  # Save only at epoch end
+        save_total_limit=2,  # Keep only 2 checkpoints
+        dataloader_drop_last=True,  # Drop incomplete batches
+        dataloader_pin_memory=False,  # Reduce memory usage
+        remove_unused_columns=False,
         report_to=["wandb"] if args.wandb_project else None,
+        max_length=args.max_len,
+        max_prompt_length=256,  # Limit prompt length
+        gradient_checkpointing=args.gradient_checkpointing,
+    )
+
+    # Clear cache before creating trainer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Trainer
+    trainer = DPOTrainer(
+        model=policy_model,
+        ref_model=ref_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        processing_class=tokenizer,
     )
 
     # Kick off training
     if accelerator.is_main_process:
         print("Starting training…")
+        print(f"GPU memory before training: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+    
     trainer.train()
 
     # Save
