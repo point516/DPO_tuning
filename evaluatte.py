@@ -479,10 +479,10 @@ def evaluate_stereoset(model_path: str, device: str = "auto") -> Dict[str, Any]:
                         # Calculate log probability of completion
                         log_probs = torch.nn.functional.log_softmax(completion_logits, dim=-1)
                         completion_log_prob = log_probs.gather(1, completion_labels.unsqueeze(1)).squeeze(1)
-                        avg_log_prob = completion_log_prob.mean().item()
+                        sum_log_prob = completion_log_prob.sum().item()
                         
                         # Convert to probability (higher is better)
-                        prob = torch.exp(torch.tensor(avg_log_prob)).item()
+                        prob = torch.exp(torch.tensor(sum_log_prob)).item()
                         
                     else:
                         # Fallback if context is same length as full text

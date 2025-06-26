@@ -9,8 +9,8 @@ Run locally or on a single‑GPU cloud instance (e.g. RunPod A100). Example:
         --subset_size 20000 \
         --subset_strategy random \
         --output_dir ./dpo_dolly_20k \
-        --batch_size 32 \
-        --gradient_accumulation_steps 16 \
+        --batch_size 64 \
+        --gradient_accumulation_steps 8 \
         --epochs 3 \
         --learning_rate 2e-5 \
         --beta 0.1
@@ -74,6 +74,41 @@ def sample_hh_dataset(
     hh = hh.remove_columns([col for col in hh.column_names if col not in {"prompt", "chosen", "rejected"}])
     return hh
 
+def preprocess_dataset(dataset, tokenizer, max_len):
+    """Pre-tokenize the dataset to avoid on-the-fly tokenization during training."""
+    def preprocess_function(examples):
+        # Tokenize prompts, chosen, and rejected responses
+        prompts = examples["prompt"]
+        chosen = examples["chosen"]
+        rejected = examples["rejected"]
+        
+        # Tokenize each field
+        prompt_tokens = tokenizer(prompts, truncation=True, max_length=256, padding=False)
+        chosen_tokens = tokenizer(chosen, truncation=True, max_length=max_len, padding=False)
+        rejected_tokens = tokenizer(rejected, truncation=True, max_length=max_len, padding=False)
+        
+        return {
+            "prompt": prompts,
+            "chosen": chosen,
+            "rejected": rejected,
+            "prompt_input_ids": prompt_tokens["input_ids"],
+            "prompt_attention_mask": prompt_tokens["attention_mask"],
+            "chosen_input_ids": chosen_tokens["input_ids"],
+            "chosen_attention_mask": chosen_tokens["attention_mask"],
+            "rejected_input_ids": rejected_tokens["input_ids"],
+            "rejected_attention_mask": rejected_tokens["attention_mask"],
+        }
+    
+    # Process dataset in batches with multiple workers for speed
+    processed_dataset = dataset.map(
+        preprocess_function,
+        batched=True,
+        num_proc=8,
+        desc="Tokenizing dataset"
+    )
+    
+    return processed_dataset
+
 ################################################################################
 # Argument parsing
 ################################################################################
@@ -87,16 +122,15 @@ def parse_args():
     parser.add_argument("--subset_strategy", choices=["random", "stratified"], default="random")
     parser.add_argument("--subset_seed", type=int, default=42, help="Deterministic seed for subset sampling")
 
-    # Training hyper‑parameters
+    # Training hyper‑parameters - Updated defaults for optimization 5
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=32, help="Reduced default batch size for memory efficiency")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Increased to maintain effective batch size")
+    parser.add_argument("--batch_size", type=int, default=64, help="Increased batch size for better GPU utilization")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Reduced to maintain effective batch size")
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.1, help="β coefficient in DPO objective")
     parser.add_argument("--max_len", type=int, default=512)
 
     # Memory optimization options
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing to save memory")
     parser.add_argument("--use_4bit", action="store_true", help="Use 4-bit quantization for even more memory savings")
     parser.add_argument("--share_reference_model", action="store_true", default=True, help="Share reference model to save memory")
 
@@ -124,7 +158,6 @@ def main():
         print(f"  - Batch size: {args.batch_size}")
         print(f"  - Gradient accumulation steps: {args.gradient_accumulation_steps}")
         print(f"  - Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
-        print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
         print(f"  - Share reference model: {args.share_reference_model}")
 
     # Ensure determinism
@@ -140,11 +173,12 @@ def main():
         tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
         print(f"Fixed tokenizer: pad_token_id={tokenizer.pad_token_id}, eos_token_id={tokenizer.eos_token_id}")
 
-    # Prepare model loading kwargs
+    # Prepare model loading kwargs with Flash Attention 2 (optimization 3)
     model_kwargs = {
         "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         "device_map": "auto",
         "trust_remote_code": True,
+        "attn_implementation": "flash_attention_2",  # Enable Flash Attention 2
     }
 
     # Add quantization if requested
@@ -158,12 +192,10 @@ def main():
         )
 
     # Load policy model (trainable)
+    if accelerator.is_main_process:
+        print("Loading policy model with Flash Attention 2...")
     policy_model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
     policy_model.resize_token_embeddings(len(tokenizer))
-
-    # Enable gradient checkpointing for memory savings
-    if args.gradient_checkpointing:
-        policy_model.gradient_checkpointing_enable()
 
     # Reference model handling
     if args.share_reference_model:
@@ -177,7 +209,7 @@ def main():
         if accelerator.is_main_process:
             print("Using separate reference model")
 
-    # Dataset
+    # Dataset with pre-tokenization (optimization 2)
     if accelerator.is_main_process:
         print("Sampling HH‑RLHF subset…")
     train_dataset = sample_hh_dataset(
@@ -185,8 +217,12 @@ def main():
         strategy=args.subset_strategy,
         seed=args.subset_seed,
     )
+    
+    if accelerator.is_main_process:
+        print("Pre-tokenizing dataset for faster training...")
+    train_dataset = preprocess_dataset(train_dataset, tokenizer, args.max_len)
 
-    # Create DPO training arguments with memory optimizations
+    # Create DPO training arguments with optimizations
     training_args = DPOConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -197,15 +233,15 @@ def main():
         bf16=torch.cuda.is_available(),
         fp16=not torch.cuda.is_available(),
         logging_steps=10,
-        save_strategy="epoch",  # Save only at epoch end
-        save_total_limit=2,  # Keep only 2 checkpoints
-        dataloader_drop_last=True,  # Drop incomplete batches
-        dataloader_pin_memory=False,  # Reduce memory usage
+        save_strategy="epoch",
+        save_total_limit=2,
+        dataloader_drop_last=True,
+        dataloader_pin_memory=True,  # Re-enable pin memory for faster host->device transfer
         remove_unused_columns=False,
         report_to=["wandb"] if args.wandb_project else None,
         max_length=args.max_len,
-        max_prompt_length=256,  # Limit prompt length
-        gradient_checkpointing=args.gradient_checkpointing,
+        max_prompt_length=256,
+        gradient_checkpointing=False,  # Optimization 1: Disable gradient checkpointing for speed
     )
 
     # Clear cache before creating trainer
@@ -218,13 +254,19 @@ def main():
         ref_model=ref_model,
         args=training_args,
         train_dataset=train_dataset,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,  # Use tokenizer parameter instead of processing_class
     )
 
     # Kick off training
     if accelerator.is_main_process:
         print("Starting training…")
-        print(f"GPU memory before training: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        print(f"Optimizations applied:")
+        print(f"  ✓ Gradient checkpointing disabled")
+        print(f"  ✓ Dataset pre-tokenized")
+        print(f"  ✓ Flash Attention 2 enabled")
+        print(f"  ✓ Increased batch size to {args.batch_size}, reduced grad accumulation to {args.gradient_accumulation_steps}")
+        if torch.cuda.is_available():
+            print(f"GPU memory before training: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
     
     trainer.train()
 
