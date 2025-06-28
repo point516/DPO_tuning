@@ -59,19 +59,54 @@ def sample_hh_dataset(
     if strategy == "random":
         hh = hh.shuffle(seed=seed).select(range(size))
     elif strategy == "stratified":
-        # Split by helpful vs harmless tags.
-        helpful = hh.filter(lambda ex: ex["helpfulness"] == "helpful")
-        harmless = hh.filter(lambda ex: ex["harmlessness"] == "harmless")
-        half = size // 2
-        helpful = helpful.shuffle(seed=seed).select(range(half))
-        harmless = harmless.shuffle(seed=seed).select(range(size - half))
-        hh = helpful.concatenate(harmless)
-        hh = hh.shuffle(seed=seed)
+        # For stratified sampling, we can't easily filter by helpfulness/harmlessness
+        # since the dataset doesn't have those labels, so we'll fall back to random
+        hh = hh.shuffle(seed=seed).select(range(size))
     else:
         raise ValueError("Unsupported subset_strategy. Choose 'random' or 'stratified'.")
 
-    # Keep only the columns DPO expects.
-    hh = hh.remove_columns([col for col in hh.column_names if col not in {"prompt", "chosen", "rejected"}])
+    # Process the dataset to extract prompts and create the expected format
+    def process_conversations(examples):
+        prompts = []
+        chosen_responses = []
+        rejected_responses = []
+        
+        for chosen_conv, rejected_conv in zip(examples["chosen"], examples["rejected"]):
+            # Split conversations to extract the last exchange
+            chosen_parts = chosen_conv.split("\n\nAssistant:")
+            rejected_parts = rejected_conv.split("\n\nAssistant:")
+            
+            if len(chosen_parts) >= 2 and len(rejected_parts) >= 2:
+                # Extract the prompt (everything up to the last assistant response)
+                prompt = chosen_parts[0]
+                if not prompt.startswith("Human:"):
+                    prompt = "Human: " + prompt
+                
+                # Extract the responses (last assistant response)
+                chosen_response = chosen_parts[-1].strip()
+                rejected_response = rejected_parts[-1].strip()
+                
+                prompts.append(prompt)
+                chosen_responses.append(chosen_response)
+                rejected_responses.append(rejected_response)
+        
+        return {
+            "prompt": prompts,
+            "chosen": chosen_responses,
+            "rejected": rejected_responses
+        }
+    
+    # Apply the processing function
+    hh = hh.map(
+        process_conversations,
+        batched=True,
+        remove_columns=hh.column_names,
+        desc="Processing conversations"
+    )
+    
+    # Filter out any empty examples
+    hh = hh.filter(lambda x: len(x["prompt"]) > 0 and len(x["chosen"]) > 0 and len(x["rejected"]) > 0)
+    
     return hh
 
 def preprocess_dataset(dataset, tokenizer, max_len):
@@ -82,8 +117,11 @@ def preprocess_dataset(dataset, tokenizer, max_len):
         chosen = examples["chosen"]
         rejected = examples["rejected"]
         
+        # Calculate prompt length proportional to max_len
+        max_prompt_len = min(384, max_len // 2)
+        
         # Tokenize each field
-        prompt_tokens = tokenizer(prompts, truncation=True, max_length=256, padding=False)
+        prompt_tokens = tokenizer(prompts, truncation=True, max_length=max_prompt_len, padding=False)
         chosen_tokens = tokenizer(chosen, truncation=True, max_length=max_len, padding=False)
         rejected_tokens = tokenizer(rejected, truncation=True, max_length=max_len, padding=False)
         
@@ -124,14 +162,15 @@ def parse_args():
 
     # Training hyper‑parameters - Updated defaults for optimization 5
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=64, help="Increased batch size for better GPU utilization")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Reduced to maintain effective batch size")
+    parser.add_argument("--batch_size", type=int, default=96, help="Increased batch size for better GPU utilization with quantization")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=6, help="Reduced to maintain effective batch size while utilizing freed memory")
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--beta", type=float, default=0.1, help="β coefficient in DPO objective")
-    parser.add_argument("--max_len", type=int, default=512)
+    parser.add_argument("--max_len", type=int, default=768, help="Increased sequence length to utilize freed memory from quantization")
 
     # Memory optimization options
     parser.add_argument("--use_4bit", action="store_true", help="Use 4-bit quantization for even more memory savings")
+    parser.add_argument("--use_8bit", action="store_true", help="Use 8-bit quantization for memory savings with better precision")
     parser.add_argument("--share_reference_model", action="store_true", default=True, help="Share reference model to save memory")
 
     # Misc
@@ -158,10 +197,31 @@ def main():
         print(f"  - Batch size: {args.batch_size}")
         print(f"  - Gradient accumulation steps: {args.gradient_accumulation_steps}")
         print(f"  - Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+        print(f"  - Max sequence length: {args.max_len}")
         print(f"  - Share reference model: {args.share_reference_model}")
+        
+        # Display quantization info
+        if args.use_8bit:
+            print(f"  - Using 8-bit quantization (good balance of memory vs precision)")
+        elif args.use_4bit:
+            print(f"  - Using 4-bit quantization (maximum memory savings)")
+        else:
+            print(f"  - Using full precision (no quantization)")
+            
+        # Memory utilization recommendations
+        if args.use_8bit or args.use_4bit:
+            print(f"Quantization benefits:")
+            print(f"  ✓ ~50% memory reduction from quantization")
+            print(f"  ✓ Larger batch sizes possible")
+            print(f"  ✓ Longer sequences supported")
+            print(f"  ✓ Can train larger models on same hardware")
 
     # Ensure determinism
     set_seed(args.seed)
+
+    # Validate quantization options
+    if args.use_4bit and args.use_8bit:
+        raise ValueError("Cannot use both 4-bit and 8-bit quantization simultaneously. Choose one.")
 
     # Load tokenizer (shared between policy & ref)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="right")
@@ -189,6 +249,13 @@ def main():
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4"
+        )
+    elif args.use_8bit:
+        from transformers import BitsAndBytesConfig
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=False,  # Keep everything on GPU
+            llm_int8_has_fp16_weight=False
         )
 
     # Load policy model (trainable)
@@ -240,8 +307,8 @@ def main():
         remove_unused_columns=False,
         report_to=["wandb"] if args.wandb_project else None,
         max_length=args.max_len,
-        max_prompt_length=256,
-        gradient_checkpointing=False,  # Optimization 1: Disable gradient checkpointing for speed
+        max_prompt_length=min(384, args.max_len // 2),  # Proportional to max_len but capped
+        gradient_checkpointing=True,   # Enable gradient checkpointing to save memory
     )
 
     # Clear cache before creating trainer
@@ -254,17 +321,22 @@ def main():
         ref_model=ref_model,
         args=training_args,
         train_dataset=train_dataset,
-        tokenizer=tokenizer,  # Use tokenizer parameter instead of processing_class
+        processing_class=tokenizer,  # Use processing_class parameter as per current API
     )
 
     # Kick off training
     if accelerator.is_main_process:
         print("Starting training…")
         print(f"Optimizations applied:")
-        print(f"  ✓ Gradient checkpointing disabled")
+        print(f"  ✓ Gradient checkpointing enabled")
         print(f"  ✓ Dataset pre-tokenized")
         print(f"  ✓ Flash Attention 2 enabled")
         print(f"  ✓ Increased batch size to {args.batch_size}, reduced grad accumulation to {args.gradient_accumulation_steps}")
+        print(f"  ✓ Increased max sequence length to {args.max_len}")
+        if args.use_8bit:
+            print(f"  ✓ 8-bit quantization enabled (memory efficient with good precision)")
+        elif args.use_4bit:
+            print(f"  ✓ 4-bit quantization enabled (maximum memory efficiency)")
         if torch.cuda.is_available():
             print(f"GPU memory before training: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
     
