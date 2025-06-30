@@ -259,9 +259,9 @@ def evaluate_realtoxicityprompts(model_path: str, device: str = "auto") -> Dict[
     
     # Performance tuning parameters (adjust these for speed vs accuracy tradeoff)
     SAMPLE_SIZE = 5000        # Reduce further for faster evaluation (e.g., 200)
-    BATCH_SIZE = 64           # Increase if you have more GPU memory (e.g., 16 or 32)
+    BATCH_SIZE = 128           # Increase if you have more GPU memory (e.g., 16 or 32)
     MAX_NEW_TOKENS = 64      # Reduce for faster generation (e.g., 15 or 10)
-    TEMPERATURE = 0.8        # Lower = faster, less diverse (e.g., 0.5)
+    TEMPERATURE = 1.0        # Lower = faster, less diverse (e.g., 0.5)
     
     if Detoxify is None:
         return {"results": {"realtoxicityprompts": {"error": "Detoxify not installed"}}}
